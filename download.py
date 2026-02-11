@@ -146,7 +146,7 @@ class UdacityDownloader:
                         'state' in query and 'data' in query['state']):
                         return query['state']['data']
             # Check if this dict directly has programTree-like structure
-            if 'parts' in obj and 'title' in obj and 'key' in obj:
+            if ('parts' in obj or 'lessons' in obj) and 'title' in obj and 'key' in obj:
                 return obj
             # Recurse into dict values
             for v in obj.values():
@@ -223,33 +223,93 @@ class UdacityDownloader:
         logger.warning("programTree not found in RSC response")
         return None
         
-    def _parse_rsc_concept_content(self, rsc_response: str) -> str:
+    def _extract_t_blocks(self, rsc_response: str) -> List[str]:
         """
-        Extract concept text content from RSC T-prefixed lines.
-        
-        Args:
-            rsc_response: Raw RSC response text
-            
-        Returns:
-            Concept content as markdown text
+        Extract T-block text content from RSC response.
+        T-blocks span multiple lines: ID:T{hex_length},{content_of_exact_byte_length}
         """
-        lines = rsc_response.split('\n')
-        content_parts = []
+        blocks = []
+        # Find all T-block headers in the raw response (not split by newline)
+        for m in re.finditer(r'([0-9a-fA-F]+):T([0-9a-fA-F]+),', rsc_response):
+            hex_len = int(m.group(2), 16)
+            content_start = m.end()
+            content = rsc_response[content_start:content_start + hex_len]
+            # Skip base64-encoded search keys and other non-content blocks
+            if content and not re.match(r'^[A-Za-z0-9+/=]{50,}$', content[:60]):
+                blocks.append(content)
+        return blocks
+
+    def _extract_concept_atoms(self, rsc_response: str) -> List[Dict]:
+        """
+        Extract concept atom data (video, text, image, quiz) from RSC response.
+        Atoms are in JSON segments with the structure: {atoms: [{semanticType, video/text/...}]}
+        """
+        atoms = []
+        for seg in self._extract_rsc_segments(rsc_response):
+            if 'atoms' not in seg:
+                continue
+            m = re.match(r'^[0-9a-fA-F]+:', seg)
+            if not m:
+                continue
+            try:
+                data = json.loads(seg[m.end():])
+                def find_atoms(obj):
+                    if isinstance(obj, dict):
+                        if 'atoms' in obj and isinstance(obj['atoms'], list):
+                            return obj['atoms']
+                        for v in obj.values():
+                            result = find_atoms(v)
+                            if result:
+                                return result
+                    elif isinstance(obj, list):
+                        for item in obj:
+                            result = find_atoms(item)
+                            if result:
+                                return result
+                    return None
+                found = find_atoms(data)
+                if found:
+                    return found
+            except (json.JSONDecodeError, ValueError):
+                continue
+        return atoms
+
+    def _parse_concept_data(self, rsc_response: str) -> Dict[str, Any]:
+        """
+        Parse concept page RSC response to extract text content and video info.
+        Returns dict with 'text' (markdown), 'video' (dict or None), 'subtitle_url' (str or None).
+        """
+        result = {'text': '', 'video': None, 'subtitle_url': None}
         
-        for line in lines:
-            # Look for T-prefixed content lines: ID:T{hex_length},{content}
-            if re.match(r'^\d+:T[0-9a-fA-F]+,', line):
-                try:
-                    # Extract the content after the comma
-                    comma_idx = line.index(',')
-                    content = line[comma_idx + 1:]
-                    # Unescape newlines
-                    content = content.replace('\\n', '\n')
-                    content_parts.append(content)
-                except ValueError:
-                    continue
-                    
-        return '\n\n'.join(content_parts)
+        # Method 1: Extract from atoms (structured data - has video info)
+        atoms = self._extract_concept_atoms(rsc_response)
+        if atoms:
+            text_parts = []
+            for atom in atoms:
+                st = atom.get('semanticType', '')
+                if st == 'VideoAtom' and 'video' in atom:
+                    video = atom['video']
+                    result['video'] = {
+                        'youtube_id': video.get('youtubeId'),
+                        'topher_id': video.get('topherId'),
+                    }
+                    result['subtitle_url'] = video.get('subtitlesUrl')
+                elif st == 'TextAtom' and 'text' in atom:
+                    text_parts.append(atom['text'])
+                elif st == 'ImageAtom' and 'image' in atom:
+                    img = atom['image']
+                    if isinstance(img, dict) and img.get('url'):
+                        text_parts.append(f"![{img.get('caption', 'Image')}]({img['url']})")
+            if text_parts:
+                result['text'] = '\n\n'.join(text_parts)
+                return result
+        
+        # Method 2: Extract from T-blocks (text content that spans multiple lines)
+        t_blocks = self._extract_t_blocks(rsc_response)
+        if t_blocks:
+            result['text'] = '\n\n'.join(t_blocks)
+        
+        return result
         
     def _get_course_data(self, course_key: str) -> Optional[Dict[str, Any]]:
         """
@@ -286,28 +346,22 @@ class UdacityDownloader:
         return program_tree
         
     def _get_concept_content(self, course_key: str, version: str, part_key: str, 
-                           lesson_key: str, concept_key: str) -> str:
+                           lesson_key: str, concept_key: str) -> Dict[str, Any]:
         """
-        Fetch individual concept content.
+        Fetch individual concept content including text and video data.
         
-        Args:
-            course_key: Course identifier
-            version: Course version
-            part_key: Part identifier
-            lesson_key: Lesson identifier  
-            concept_key: Concept identifier
-            
         Returns:
-            Concept content as markdown
+            Dict with 'text', 'video', 'subtitle_url' keys
         """
-        concept_url = (f"https://learn.udacity.com/{course_key}?"
-                      f"version={version}&partKey={part_key}&"
-                      f"lessonKey={lesson_key}&conceptKey={concept_key}")
+        params = f"version={version}&lessonKey={lesson_key}&conceptKey={concept_key}"
+        if part_key:
+            params = f"version={version}&partKey={part_key}&lessonKey={lesson_key}&conceptKey={concept_key}"
+        concept_url = f"https://learn.udacity.com/{course_key}?{params}"
         
         response = self._make_rsc_request(concept_url, next_url=f"/{course_key}")
         if response:
-            return self._parse_rsc_concept_content(response)
-        return ""
+            return self._parse_concept_data(response)
+        return {'text': '', 'video': None, 'subtitle_url': None}
         
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for filesystem compatibility"""
@@ -407,11 +461,9 @@ class UdacityDownloader:
             if not filename:
                 continue
                 
-            # Organize by resource type
-            if 'Videos' in name and filename.endswith('.zip'):
-                filepath = lesson_dir / f"{filename}"
-            elif 'Subtitles' in name and filename.endswith('.zip'):
-                filepath = lesson_dir / f"{filename}"
+            # Organize by resource type — zips in lesson dir, other resources in resources/
+            if filename.endswith('.zip'):
+                filepath = lesson_dir / filename
             else:
                 filepath = resources_dir / filename
                 
@@ -424,25 +476,12 @@ class UdacityDownloader:
                             course_key: str, version: str, part_key: str, 
                             lesson_key: str) -> int:
         """
-        Save concept text content as markdown files.
-        
-        Args:
-            concepts: List of concept dictionaries
-            lesson_dir: Directory to save concept files
-            course_key: Course identifier
-            version: Course version
-            part_key: Part identifier
-            lesson_key: Lesson identifier
-            
-        Returns:
-            Number of concepts saved
+        Save concept text content as markdown files directly in lesson dir.
+        Includes video links (YouTube) and subtitle URLs when available.
         """
         if not concepts:
             return 0
             
-        concepts_dir = lesson_dir / "concepts"
-        concepts_dir.mkdir(parents=True, exist_ok=True)
-        
         saved_count = 0
         
         for i, concept in enumerate(concepts, 1):
@@ -452,10 +491,10 @@ class UdacityDownloader:
             concept_key = concept['key']
             concept_title = concept.get('title', f'Concept {i}')
             
-            # Create safe filename
+            # Create safe filename — directly in lesson dir (no concepts/ subdir)
             safe_title = self._sanitize_filename(concept_title)
             filename = f"{i:02d}_{safe_title}.md"
-            filepath = concepts_dir / filename
+            filepath = lesson_dir / filename
             
             # Skip if already exists
             if filepath.exists():
@@ -464,18 +503,31 @@ class UdacityDownloader:
                 
             # Fetch concept content
             logger.info(f"Fetching concept content: {concept_title}")
-            content = self._get_concept_content(
+            data = self._get_concept_content(
                 course_key, version, part_key, lesson_key, concept_key
             )
             
-            if content:
-                # Create markdown file
-                markdown_content = f"# {concept_title}\n\n"
-                markdown_content += f"**Concept Key:** `{concept_key}`\n\n"
-                markdown_content += "---\n\n"
-                markdown_content += content
+            text = data.get('text', '')
+            video = data.get('video')
+            subtitle_url = data.get('subtitle_url')
+            
+            if text or video:
+                # Build markdown file
+                md = f"# {concept_title}\n\n"
                 
-                filepath.write_text(markdown_content, encoding='utf-8')
+                # Add video info if present
+                if video:
+                    yt_id = video.get('youtube_id')
+                    if yt_id:
+                        md += f"🎥 **Video:** [Watch on YouTube](https://www.youtube.com/watch?v={yt_id})\n\n"
+                    if subtitle_url:
+                        md += f"📝 **Subtitles:** [VTT]({subtitle_url})\n\n"
+                    md += "---\n\n"
+                
+                if text:
+                    md += text
+                
+                filepath.write_text(md, encoding='utf-8')
                 logger.info(f"Saved concept: {filename}")
                 saved_count += 1
             else:
@@ -486,18 +538,10 @@ class UdacityDownloader:
     def download_course(self, course_key: str) -> bool:
         """
         Download a complete course.
-        
-        Args:
-            course_key: Course identifier (e.g., 'nd123')
-            
-        Returns:
-            True if successful, False otherwise
+        Handles both nanodegree (parts → lessons) and simple course (lessons only) structures.
         """
         print(f"\n🎓 Starting download for course: {course_key}")
         logger.info(f"Starting course download: {course_key}")
-        
-        course_dir = self.output_dir / course_key
-        course_dir.mkdir(parents=True, exist_ok=True)
         
         # Fetch course data using RSC API
         print(f"🌐 Fetching course structure from Udacity RSC API...")
@@ -509,11 +553,31 @@ class UdacityDownloader:
             
         # Extract course information
         course_title = course_data.get('title', course_key)
-        parts = course_data.get('parts', [])
         version = course_data.get('version', '1.0.0')
         
-        print(f"📚 Course: {course_title}")
-        print(f"📁 Found {len(parts)} parts")
+        # Course dir: "<id> <title>"
+        safe_title = self._sanitize_filename(course_title)
+        course_dir = self.output_dir / f"{course_key} {safe_title}"
+        course_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Handle both structures:
+        # - Nanodegrees have "parts" containing "lessons"
+        # - Simple courses (ud*) have "lessons" directly at top level
+        parts = course_data.get('parts') or []
+        top_level_lessons = course_data.get('lessons') or []
+        
+        if not parts and top_level_lessons:
+            # Simple course: wrap lessons in a single virtual part
+            parts = [{
+                'key': '',
+                'title': course_title,
+                'lessons': top_level_lessons,
+            }]
+            print(f"📚 Course: {course_title} (simple course)")
+            print(f"📄 Found {len(top_level_lessons)} lessons")
+        else:
+            print(f"📚 Course: {course_title}")
+            print(f"📁 Found {len(parts)} parts")
         
         # Save course metadata
         metadata = {
@@ -533,21 +597,24 @@ class UdacityDownloader:
         total_concepts = 0
         total_downloads = 0
         
-        for part in parts:
+        for part_idx, part in enumerate(parts, 1):
             if not isinstance(part, dict):
                 continue
                 
             part_key = part.get('key', '')
             part_title = part.get('title', 'Unknown Part')
-            lessons = part.get('lessons', [])
+            lessons = part.get('lessons') or []
             
-            print(f"\n📖 Part: {part_title} ({len(lessons)} lessons)")
+            print(f"\n📖 Part {part_idx}: {part_title} ({len(lessons)} lessons)")
             
-            # Create part directory
+            # Numbered part directory (skip if single virtual part for simple courses)
             safe_part_title = self._sanitize_filename(part_title)
-            part_dir = course_dir / safe_part_title
+            if len(parts) > 1:
+                part_dir = course_dir / f"{part_idx:02d} {safe_part_title}"
+            else:
+                part_dir = course_dir  # Simple course: lessons directly in course dir
             
-            for lesson in lessons:
+            for lesson_idx, lesson in enumerate(lessons, 1):
                 if not isinstance(lesson, dict):
                     continue
                     
@@ -556,26 +623,13 @@ class UdacityDownloader:
                 concepts = lesson.get('concepts') or []
                 resources = lesson.get('resources') or []
                 
-                print(f"  📄 {lesson_title} ({len(concepts)} concepts, {len(resources)} resources)")
+                print(f"  📄 {lesson_idx}. {lesson_title} ({len(concepts)} concepts, {len(resources)} resources)")
                 total_lessons += 1
                 
-                # Create lesson directory
+                # Numbered lesson directory
                 safe_lesson_title = self._sanitize_filename(lesson_title)
-                lesson_dir = part_dir / safe_lesson_title
+                lesson_dir = part_dir / f"{lesson_idx:02d} {safe_lesson_title}"
                 lesson_dir.mkdir(parents=True, exist_ok=True)
-                
-                # Save lesson metadata
-                lesson_metadata = {
-                    'lesson_key': lesson_key,
-                    'title': lesson_title,
-                    'part_title': part_title,
-                    'concepts_count': len(concepts),
-                    'resources_count': len(resources),
-                }
-                
-                (lesson_dir / 'lesson_metadata.json').write_text(
-                    json.dumps(lesson_metadata, indent=2), encoding='utf-8'
-                )
                 
                 # Download resources
                 downloaded_resources = self._process_lesson_resources(
@@ -583,7 +637,7 @@ class UdacityDownloader:
                 )
                 total_downloads += downloaded_resources
                 
-                # Save concept content
+                # Save concept content (directly in lesson dir, no concepts/ subdir)
                 saved_concepts = self._save_concept_content(
                     concepts, lesson_dir, course_key, version, 
                     part_key, lesson_key
