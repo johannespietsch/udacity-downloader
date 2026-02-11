@@ -304,12 +304,14 @@ class UdacityDownloader:
         
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for filesystem compatibility"""
+        # Remove path separators and parent directory references
+        filename = filename.replace('..', '_')
         # Replace invalid characters with underscores
         invalid_chars = '<>:"/\\|?*'
         for char in invalid_chars:
             filename = filename.replace(char, '_')
-        # Limit length and strip
-        return filename[:100].strip()
+        # Limit length and strip trailing dots/spaces (Windows compat)
+        return filename[:100].strip('. ')
         
     def _download_file(self, url: str, filepath: Path, description: str = "") -> bool:
         """
