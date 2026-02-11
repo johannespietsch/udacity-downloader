@@ -75,6 +75,13 @@ class UdacityDownloader:
         
         # Downloaded files tracking for resume capability
         self.downloaded_files: Set[str] = set()
+
+        # Separate session for file downloads (no RSC headers)
+        self.download_session = requests.Session()
+        self.download_session.headers.update({
+            'User-Agent': self.session.headers['User-Agent'],
+            'Cookie': self.session.headers['Cookie'],
+        })
         
     def _rate_limit(self):
         """Enforce rate limiting between requests"""
@@ -335,21 +342,14 @@ class UdacityDownloader:
         filepath.parent.mkdir(parents=True, exist_ok=True)
         
         try:
-            # Use a separate session for downloads (no RSC headers)
-            download_session = requests.Session()
-            download_session.headers.update({
-                'User-Agent': self.session.headers['User-Agent'],
-                'Cookie': self.session.headers['Cookie'],
-            })
-            
             # Get file size for progress bar
             self._rate_limit()
-            head_response = download_session.head(url, timeout=10)
+            head_response = self.download_session.head(url, timeout=10)
             total_size = int(head_response.headers.get('content-length', 0))
             
             # Download with progress bar
             self._rate_limit()
-            response = download_session.get(url, stream=True, timeout=60)
+            response = self.download_session.get(url, stream=True, timeout=60)
             response.raise_for_status()
             
             with open(filepath, 'wb') as file, tqdm(
