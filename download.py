@@ -235,16 +235,31 @@ class UdacityDownloader:
             content_start = m.end()
             content = rsc_response[content_start:content_start + hex_len]
             # Skip base64-encoded search keys and other non-content blocks
-            if content and not re.match(r'^[A-Za-z0-9+/=]{50,}$', content[:60]):
+            if content and not re.match(r'^[A-Za-z0-9+/=]{50,}$', content.strip()):
                 blocks.append(content)
         return blocks
+
+    def _find_atoms_in_obj(self, obj: Any) -> Optional[List[Dict]]:
+        """Recursively search for an atoms list in a parsed JSON object."""
+        if isinstance(obj, dict):
+            if 'atoms' in obj and isinstance(obj['atoms'], list):
+                return obj['atoms']
+            for v in obj.values():
+                result = self._find_atoms_in_obj(v)
+                if result:
+                    return result
+        elif isinstance(obj, list):
+            for item in obj:
+                result = self._find_atoms_in_obj(item)
+                if result:
+                    return result
+        return None
 
     def _extract_concept_atoms(self, rsc_response: str) -> List[Dict]:
         """
         Extract concept atom data (video, text, image, quiz) from RSC response.
         Atoms are in JSON segments with the structure: {atoms: [{semanticType, video/text/...}]}
         """
-        atoms = []
         for seg in self._extract_rsc_segments(rsc_response):
             if 'atoms' not in seg:
                 continue
@@ -253,34 +268,20 @@ class UdacityDownloader:
                 continue
             try:
                 data = json.loads(seg[m.end():])
-                def find_atoms(obj):
-                    if isinstance(obj, dict):
-                        if 'atoms' in obj and isinstance(obj['atoms'], list):
-                            return obj['atoms']
-                        for v in obj.values():
-                            result = find_atoms(v)
-                            if result:
-                                return result
-                    elif isinstance(obj, list):
-                        for item in obj:
-                            result = find_atoms(item)
-                            if result:
-                                return result
-                    return None
-                found = find_atoms(data)
+                found = self._find_atoms_in_obj(data)
                 if found:
                     return found
             except (json.JSONDecodeError, ValueError):
                 continue
-        return atoms
+        return []
 
     def _parse_concept_data(self, rsc_response: str) -> Dict[str, Any]:
         """
         Parse concept page RSC response to extract text content and video info.
-        Returns dict with 'text' (markdown), 'video' (dict or None), 'subtitle_url' (str or None).
+        Returns dict with 'text' (markdown), 'videos' (list of dicts), 'subtitle_urls' (list of strs).
         """
-        result = {'text': '', 'video': None, 'subtitle_url': None}
-        
+        result = {'text': '', 'videos': [], 'subtitle_urls': []}
+
         # Method 1: Extract from atoms (structured data - has video info)
         atoms = self._extract_concept_atoms(rsc_response)
         if atoms:
@@ -289,11 +290,13 @@ class UdacityDownloader:
                 st = atom.get('semanticType', '')
                 if st == 'VideoAtom' and 'video' in atom:
                     video = atom['video']
-                    result['video'] = {
+                    result['videos'].append({
                         'youtube_id': video.get('youtubeId'),
                         'topher_id': video.get('topherId'),
-                    }
-                    result['subtitle_url'] = video.get('subtitlesUrl')
+                    })
+                    sub_url = video.get('subtitlesUrl')
+                    if sub_url:
+                        result['subtitle_urls'].append(sub_url)
                 elif st == 'TextAtom' and 'text' in atom:
                     text_parts.append(atom['text'])
                 elif st == 'ImageAtom' and 'image' in atom:
@@ -351,17 +354,17 @@ class UdacityDownloader:
         Fetch individual concept content including text and video data.
         
         Returns:
-            Dict with 'text', 'video', 'subtitle_url' keys
+            Dict with 'text', 'videos', 'subtitle_urls' keys
         """
         params = f"version={version}&lessonKey={lesson_key}&conceptKey={concept_key}"
         if part_key:
             params = f"version={version}&partKey={part_key}&lessonKey={lesson_key}&conceptKey={concept_key}"
         concept_url = f"https://learn.udacity.com/{course_key}?{params}"
-        
+
         response = self._make_rsc_request(concept_url, next_url=f"/{course_key}")
         if response:
             return self._parse_concept_data(response)
-        return {'text': '', 'video': None, 'subtitle_url': None}
+        return {'text': '', 'videos': [], 'subtitle_urls': []}
         
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for filesystem compatibility"""
@@ -508,20 +511,21 @@ class UdacityDownloader:
             )
             
             text = data.get('text', '')
-            video = data.get('video')
-            subtitle_url = data.get('subtitle_url')
-            
-            if text or video:
+            videos = data.get('videos', [])
+            subtitle_urls = data.get('subtitle_urls', [])
+
+            if text or videos:
                 # Build markdown file
                 md = f"# {concept_title}\n\n"
-                
+
                 # Add video info if present
-                if video:
-                    yt_id = video.get('youtube_id')
-                    if yt_id:
-                        md += f"🎥 **Video:** [Watch on YouTube](https://www.youtube.com/watch?v={yt_id})\n\n"
-                    if subtitle_url:
-                        md += f"📝 **Subtitles:** [VTT]({subtitle_url})\n\n"
+                if videos:
+                    for video in videos:
+                        yt_id = video.get('youtube_id')
+                        if yt_id and re.match(r'^[\w-]+$', yt_id):
+                            md += f"🎥 **Video:** [Watch on YouTube](https://www.youtube.com/watch?v={yt_id})\n\n"
+                    for sub_url in subtitle_urls:
+                        md += f"📝 **Subtitles:** [VTT]({sub_url})\n\n"
                     md += "---\n\n"
                 
                 if text:
@@ -630,7 +634,19 @@ class UdacityDownloader:
                 safe_lesson_title = self._sanitize_filename(lesson_title)
                 lesson_dir = part_dir / f"{lesson_idx:02d} {safe_lesson_title}"
                 lesson_dir.mkdir(parents=True, exist_ok=True)
-                
+
+                # Save lesson metadata
+                lesson_metadata = {
+                    'lesson_key': lesson_key,
+                    'title': lesson_title,
+                    'part_title': part_title,
+                    'concepts_count': len(concepts),
+                    'resources_count': len(resources),
+                }
+                (lesson_dir / 'lesson_metadata.json').write_text(
+                    json.dumps(lesson_metadata, indent=2), encoding='utf-8'
+                )
+
                 # Download resources
                 downloaded_resources = self._process_lesson_resources(
                     resources, lesson_dir, lesson_title
