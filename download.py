@@ -357,7 +357,7 @@ class UdacityDownloader:
         Fetch individual concept content including text and video data.
         
         Returns:
-            Dict with 'text', 'videos', 'subtitle_urls' keys
+            Dict with 'text' (str), 'videos' (list), 'subtitle_urls' (list)
         """
         params = f"version={version}&lessonKey={lesson_key}&conceptKey={concept_key}"
         if part_key:
@@ -366,15 +366,15 @@ class UdacityDownloader:
 
         response = self._make_rsc_request(concept_url, next_url=f"/{course_key}")
         if not response:
-            return {'text': '', 'video': None, 'subtitle_url': None}
-        
+            return {'text': '', 'videos': [], 'subtitle_urls': []}
+
         # Follow redirect if concept is routed to a different lessonKey
         redirect_url = self._parse_rsc_redirect(response)
         if redirect_url:
             parsed = urllib.parse.urlparse(redirect_url)
             response = self._make_rsc_request(redirect_url, next_url=parsed.path)
             if not response:
-                return {'text': '', 'video': None, 'subtitle_url': None}
+                return {'text': '', 'videos': [], 'subtitle_urls': []}
         
         return self._parse_concept_data(response)
         
