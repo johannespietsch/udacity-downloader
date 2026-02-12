@@ -235,8 +235,14 @@ class UdacityDownloader:
             content_start = m.end()
             content = rsc_response[content_start:content_start + hex_len]
             # Skip base64-encoded search keys and other non-content blocks
-            if content and not re.match(r'^[A-Za-z0-9+/=]{50,}$', content.strip()):
-                blocks.append(content)
+            if not content or re.match(r'^[A-Za-z0-9+/=]{50,}$', content.strip()):
+                continue
+            # Skip Marvin AI tutor chat blocks — "Marvin" component ref appears nearby before
+            context_before = rsc_response[max(0, m.start() - 500):m.start()]
+            if '"Marvin"' in context_before:
+                logger.debug(f"Skipping Marvin chat T-block (id={m.group(1)}, {hex_len} bytes)")
+                continue
+            blocks.append(content)
         return blocks
 
     def _find_atoms_in_obj(self, obj: Any) -> Optional[List[Dict]]:
