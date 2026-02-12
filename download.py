@@ -235,8 +235,14 @@ class UdacityDownloader:
             content_start = m.end()
             content = rsc_response[content_start:content_start + hex_len]
             # Skip base64-encoded search keys and other non-content blocks
-            if content and not re.match(r'^[A-Za-z0-9+/=]{50,}$', content.strip()):
-                blocks.append(content)
+            if not content or re.match(r'^[A-Za-z0-9+/=]{50,}$', content.strip()):
+                continue
+            # Skip Marvin AI tutor chat blocks — "Marvin" component ref appears nearby before
+            context_before = rsc_response[max(0, m.start() - 500):m.start()]
+            if '"Marvin"' in context_before:
+                logger.debug(f"Skipping Marvin chat T-block (id={m.group(1)}, {hex_len} bytes)")
+                continue
+            blocks.append(content)
         return blocks
 
     def _find_atoms_in_obj(self, obj: Any) -> Optional[List[Dict]]:
@@ -305,9 +311,12 @@ class UdacityDownloader:
                         text_parts.append(f"![{img.get('caption', 'Image')}]({img['url']})")
             if text_parts:
                 result['text'] = '\n\n'.join(text_parts)
-                return result
+            # If atoms were found (even just video), don't fall back to T-blocks
+            # T-blocks may contain Marvin AI chat history which is unrelated
+            return result
         
-        # Method 2: Extract from T-blocks (text content that spans multiple lines)
+        # Method 2: Extract from T-blocks ONLY if no atoms were found at all
+        # This handles pages where content is rendered purely as RSC text blocks
         t_blocks = self._extract_t_blocks(rsc_response)
         if t_blocks:
             result['text'] = '\n\n'.join(t_blocks)
@@ -354,7 +363,7 @@ class UdacityDownloader:
         Fetch individual concept content including text and video data.
         
         Returns:
-            Dict with 'text', 'videos', 'subtitle_urls' keys
+            Dict with 'text' (str), 'videos' (list), 'subtitle_urls' (list)
         """
         params = f"version={version}&lessonKey={lesson_key}&conceptKey={concept_key}"
         if part_key:
@@ -362,9 +371,18 @@ class UdacityDownloader:
         concept_url = f"https://learn.udacity.com/{course_key}?{params}"
 
         response = self._make_rsc_request(concept_url, next_url=f"/{course_key}")
-        if response:
-            return self._parse_concept_data(response)
-        return {'text': '', 'videos': [], 'subtitle_urls': []}
+        if not response:
+            return {'text': '', 'videos': [], 'subtitle_urls': []}
+
+        # Follow redirect if concept is routed to a different lessonKey
+        redirect_url = self._parse_rsc_redirect(response)
+        if redirect_url:
+            parsed = urllib.parse.urlparse(redirect_url)
+            response = self._make_rsc_request(redirect_url, next_url=parsed.path)
+            if not response:
+                return {'text': '', 'videos': [], 'subtitle_urls': []}
+        
+        return self._parse_concept_data(response)
         
     def _sanitize_filename(self, filename: str) -> str:
         """Sanitize filename for filesystem compatibility"""
