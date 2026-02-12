@@ -5,6 +5,17 @@ Udacity Course Downloader
 Downloads course content from learn.udacity.com including videos, subtitles,
 and lesson materials. Supports Udacity's Next.js RSC (React Server Components) backend.
 
+DISCLAIMER: This tool is intended solely as a personal backup utility for
+enrolled Udacity students who wish to keep an offline copy of course materials
+they have legitimately paid for and have access to. This tool is not affiliated
+with, endorsed by, or associated with Udacity, Inc. in any way.
+
+Users are solely responsible for ensuring their use of this tool complies with
+Udacity's Terms of Use (https://www.udacity.com/legal/terms-of-use) and all
+applicable laws. Do not use this tool to redistribute, sell, or share downloaded
+content. Do not use this tool if you are not enrolled in the courses you intend
+to download.
+
 Usage:
     python download.py nd123 nd456 --token YOUR_JWT_TOKEN
     UDACITY_TOKEN=your_token python download.py nd123

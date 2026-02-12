@@ -1,5 +1,7 @@
 # Udacity Course Downloader (RSC Backend)
 
+> ⚠️ **Legal Disclaimer:** This tool is an independent personal backup utility for enrolled Udacity students. It is **not affiliated with, endorsed by, or associated with Udacity, Inc.** Users are solely responsible for ensuring their use complies with [Udacity's Terms of Use](https://www.udacity.com/legal/terms-of-use) and all applicable laws. **Do not** use this tool to redistribute, sell, or share downloaded content. Only download courses you are actively enrolled in and have paid for.
+
 A Python script to download course content from Udacity's Next.js learning platform (learn.udacity.com). This version works with Udacity's React Server Components (RSC) backend and properly handles their new authentication and data structure.
 
 ## Features
@@ -266,8 +268,21 @@ Feel free to improve the script:
 
 ## License
 
-This script is for educational purposes. Respect Udacity's terms of service and only download content you have legitimate access to through your enrollment.
+MIT License — see [LICENSE](LICENSE) for details.
 
-## Disclaimer
+This license applies to the **tool's source code only**, not to any content downloaded using it. Downloaded course materials remain the intellectual property of Udacity, Inc. and its licensors, and may be subject to Creative Commons Attribution-NonCommercial-NoDerivs 3.0 licensing where marked.
 
-This tool is not affiliated with Udacity. Use responsibly and in accordance with Udacity's terms of service. Only download courses you are enrolled in and have permission to access. The RSC format and API endpoints may change, requiring updates to this script.
+## Legal Notice & Disclaimer
+
+**This tool is not affiliated with, endorsed by, or associated with Udacity, Inc.**
+
+This is an independent personal backup utility. By using this tool, you acknowledge and agree that:
+
+- You are solely responsible for your use of this tool and any content you download
+- You will only download courses you are actively enrolled in and have legitimately paid for
+- You will not redistribute, sell, rent, publicly display, or share any downloaded content
+- You will not use downloaded content for any commercial purpose
+- You will comply with [Udacity's Terms of Use](https://www.udacity.com/legal/terms-of-use) and all applicable laws
+- The authors of this tool accept no liability for misuse or any consequences arising from use of this tool
+
+Downloaded content is intended for **personal, offline study only** as a backup of materials you already have access to through your paid enrollment. The RSC format and API endpoints may change, requiring updates to this script.
