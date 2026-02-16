@@ -85,6 +85,22 @@ query CourseStructure($key: String!) {
 }
 """
 
+PART_STRUCTURE_QUERY = """
+query PartStructure($key: String!) {
+  part(key: $key) {
+    id key title version semantic_type
+    modules {
+      key title
+      lessons {
+        key title
+        concepts { key title }
+        resources { files { uri name } }
+      }
+    }
+  }
+}
+"""
+
 CONCEPT_ATOMS_QUERY = """
 query ConceptAtoms($key: String!) {
   concept(key: $key) {
@@ -217,7 +233,25 @@ class UdacityDownloader:
                     "lessons": course.get("lessons") or [],
                 }
         except (ValueError, requests.RequestException) as exc:
-            logger.error("Course query also failed for %s: %s", course_key, exc)
+            logger.debug("Course query failed for %s: %s", course_key, exc)
+
+        # --- Fall back to part (cd* keys are often standalone Parts) ---
+        try:
+            data = self._graphql(PART_STRUCTURE_QUERY, {"key": course_key})
+            part = data.get("part")
+            if part:
+                logger.info("Fetched part: %s", part.get("title"))
+                lessons = []
+                for module in part.get("modules") or []:
+                    lessons.extend(module.get("lessons") or [])
+                return {
+                    "title": part["title"],
+                    "version": part.get("version", "1.0.0"),
+                    "semantic_type": part.get("semantic_type"),
+                    "lessons": lessons,
+                }
+        except (ValueError, requests.RequestException) as exc:
+            logger.error("Part query also failed for %s: %s", course_key, exc)
 
         return None
 
@@ -273,10 +307,19 @@ class UdacityDownloader:
                 filepath.unlink()
             return False
 
-    def _process_lesson_resources(self, resources: List[Dict], lesson_dir: Path,
+    def _process_lesson_resources(self, resources, lesson_dir: Path,
                                   lesson_title: str) -> int:
+        """Download resource files for a lesson.
+
+        ``resources`` may be a single dict ``{files: [...]}`` (GraphQL) or
+        a list of such dicts (legacy), or ``None``.
+        """
         if not resources:
             return 0
+
+        # Normalise to list
+        if isinstance(resources, dict):
+            resources = [resources]
 
         success = 0
         resources_dir = lesson_dir / "resources"
