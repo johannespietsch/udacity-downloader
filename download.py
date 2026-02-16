@@ -101,6 +101,25 @@ query PartStructure($key: String!) {
 }
 """
 
+NANODEGREE_VERSIONED_QUERY = """
+query NanodegreeVersioned($key: String!, $version: String!) {
+  nanodegree(key: $key, version: $version) {
+    id key title version semantic_type
+    parts {
+      key title
+      modules {
+        key title
+        lessons {
+          key title
+          concepts { key title }
+          resources { files { uri name } }
+        }
+      }
+    }
+  }
+}
+"""
+
 CONCEPT_ATOMS_QUERY = """
 query ConceptAtoms($key: String!) {
   concept(key: $key) {
@@ -186,6 +205,56 @@ class UdacityDownloader:
     # Data fetching
     # ------------------------------------------------------------------
 
+    def _resolve_version(self, course_key: str) -> Optional[str]:
+        """Resolve the active content version for a course key.
+
+        Udacity sometimes has a newer 'shell' version (e.g. 9.0) with no
+        parts, while the actual content lives in an older version (e.g. 8.0.23).
+        The webapp handles this via a NEXT_REDIRECT embedded in the page.
+        We replicate that by fetching the page and extracting the version param.
+        """
+        try:
+            self._wait()
+            resp = self.download_session.get(
+                f"https://learn.udacity.com/{course_key}",
+                timeout=15,
+                allow_redirects=True,
+            )
+            match = re.search(r"version=([0-9.]+)", resp.text)
+            if match:
+                version = match.group(1)
+                logger.info("Resolved version for %s: %s", course_key, version)
+                return version
+        except Exception as exc:
+            logger.debug("Version resolution failed for %s: %s", course_key, exc)
+        return None
+
+    @staticmethod
+    def _flatten_nanodegree(nd: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        """Convert a raw nanodegree GraphQL response into normalised format.
+
+        Returns None if the nanodegree has no parts (empty shell version).
+        """
+        parts_raw = nd.get("parts") or []
+        if not parts_raw:
+            return None
+        parts = []
+        for part in parts_raw:
+            lessons = []
+            for module in part.get("modules") or []:
+                lessons.extend(module.get("lessons") or [])
+            parts.append({
+                "key": part["key"],
+                "title": part.get("title", "Untitled Part"),
+                "lessons": lessons,
+            })
+        return {
+            "title": nd["title"],
+            "version": nd.get("version", "1.0.0"),
+            "semantic_type": nd.get("semantic_type"),
+            "parts": parts,
+        }
+
     def _get_course_data(self, course_key: str) -> Optional[Dict[str, Any]]:
         """
         Fetch course structure via GraphQL.
@@ -199,24 +268,33 @@ class UdacityDownloader:
             data = self._graphql(NANODEGREE_STRUCTURE_QUERY, {"key": course_key})
             nd = data.get("nanodegree")
             if nd:
-                logger.info("Fetched nanodegree: %s", nd.get("title"))
-                # Flatten modules into lessons per part
-                parts = []
-                for part in nd.get("parts") or []:
-                    lessons = []
-                    for module in part.get("modules") or []:
-                        lessons.extend(module.get("lessons") or [])
-                    parts.append({
-                        "key": part["key"],
-                        "title": part.get("title", "Untitled Part"),
-                        "lessons": lessons,
-                    })
-                return {
-                    "title": nd["title"],
-                    "version": nd.get("version", "1.0.0"),
-                    "semantic_type": nd.get("semantic_type"),
-                    "parts": parts,
-                }
+                logger.info("Fetched nanodegree: %s (v%s)", nd.get("title"), nd.get("version"))
+                result = self._flatten_nanodegree(nd)
+                if result:
+                    return result
+
+                # Empty parts — try resolving the active content version.
+                # Some nanodegrees have a newer 'shell' version with no parts
+                # while the real content lives in an older version.
+                logger.warning(
+                    "Nanodegree %s v%s has 0 parts — resolving active version...",
+                    course_key, nd.get("version"),
+                )
+                version = self._resolve_version(course_key)
+                if version and version != nd.get("version"):
+                    logger.info("Retrying with version %s", version)
+                    data2 = self._graphql(
+                        NANODEGREE_VERSIONED_QUERY,
+                        {"key": course_key, "version": version},
+                    )
+                    nd2 = data2.get("nanodegree")
+                    if nd2:
+                        result = self._flatten_nanodegree(nd2)
+                        if result:
+                            return result
+                        logger.warning("Version %s also has 0 parts", version)
+                    else:
+                        logger.warning("Version %s returned no data", version)
         except (ValueError, requests.RequestException) as exc:
             logger.debug("Nanodegree query failed for %s: %s", course_key, exc)
 
