@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """
-Udacity Course Downloader
+Udacity Course Downloader (GraphQL API)
 
 Downloads course content from learn.udacity.com including videos, subtitles,
-and lesson materials. Supports Udacity's Next.js RSC (React Server Components) backend.
+and lesson materials via the classroom-content GraphQL API.
 
 DISCLAIMER: This tool is intended solely as a personal backup utility for
 enrolled Udacity students who wish to keep an offline copy of course materials
@@ -30,766 +30,491 @@ import sys
 import time
 import urllib.parse
 from pathlib import Path
-from typing import Dict, List, Optional, Set, Tuple, Any
+from typing import Any, Dict, List, Optional, Set
 
 import requests
 from tqdm import tqdm
 
-
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
-    format='%(asctime)s - %(levelname)s - %(message)s',
+    format="%(asctime)s - %(levelname)s - %(message)s",
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('udacity_downloader.log')
-    ]
+        logging.FileHandler("udacity_downloader.log"),
+    ],
 )
 logger = logging.getLogger(__name__)
 
+GRAPHQL_ENDPOINT = "https://learn.udacity.com/api/classroom-content/v1/graphql"
+
+# ---------------------------------------------------------------------------
+# GraphQL query fragments
+# ---------------------------------------------------------------------------
+
+# Structure-only queries (no atoms – keeps payloads small)
+NANODEGREE_STRUCTURE_QUERY = """
+query NanodegreeStructure($key: String!) {
+  nanodegree(key: $key) {
+    id key title version semantic_type
+    parts {
+      key title
+      modules {
+        key title
+        lessons {
+          key title
+          concepts { key title }
+          resources { files { uri name } }
+        }
+      }
+    }
+  }
+}
+"""
+
+COURSE_STRUCTURE_QUERY = """
+query CourseStructure($key: String!) {
+  course(key: $key) {
+    id key title version semantic_type
+    lessons {
+      key title
+      concepts { key title }
+      resources { files { uri name } }
+    }
+  }
+}
+"""
+
+CONCEPT_ATOMS_QUERY = """
+query ConceptAtoms($key: String!) {
+  concept(key: $key) {
+    key title
+    atoms {
+      ... on TextAtom { semantic_type text }
+      ... on VideoAtom {
+        semantic_type
+        video { youtube_id topher_id subtitles_vtt_url }
+      }
+      ... on ImageAtom { semantic_type url caption }
+    }
+  }
+}
+"""
+
 
 class UdacityDownloader:
-    """Downloads Udacity course content from learn.udacity.com using RSC backend"""
-    
+    """Downloads Udacity course content via the classroom-content GraphQL API."""
+
     def __init__(self, token: str, output_dir: str = "output", rate_limit: float = 1.5):
-        """
-        Initialize the downloader.
-        
-        Args:
-            token: JWT authentication token (without Bearer prefix)
-            output_dir: Directory to save downloaded content
-            rate_limit: Seconds to wait between requests
-        """
         self.token = token
         self.output_dir = Path(output_dir)
         self.rate_limit = rate_limit
-        self.session = requests.Session()
-        self.last_request_time = 0
-        
-        # RSC-compatible headers for Next.js backend
-        self.session.headers.update({
-            'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': 'text/x-component',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Accept-Encoding': 'gzip, deflate, br',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'RSC': '1',
-            'Sec-Ch-Ua': '"Not_A Brand";v="8", "Chromium";v="120"',
-            'Sec-Ch-Ua-Mobile': '?0',
-            'Sec-Ch-Ua-Platform': '"macOS"',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin',
-            'Cookie': f'_jwt={token}',
-        })
-        
-        # Downloaded files tracking for resume capability
+        self.last_request_time = 0.0
         self.downloaded_files: Set[str] = set()
 
-        # Separate session for file downloads (no RSC headers)
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/120.0.0.0 Safari/537.36"
+            ),
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        })
+
+        # Separate session for file downloads (no JSON headers)
         self.download_session = requests.Session()
         self.download_session.headers.update({
-            'User-Agent': self.session.headers['User-Agent'],
-            'Cookie': self.session.headers['Cookie'],
+            "User-Agent": self.session.headers["User-Agent"],
+            "Cookie": f"_jwt={token}",
         })
-        
-    def _rate_limit(self):
-        """Enforce rate limiting between requests"""
+
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
+
+    def _wait(self):
+        """Enforce rate limiting between requests."""
         elapsed = time.time() - self.last_request_time
         if elapsed < self.rate_limit:
             time.sleep(self.rate_limit - elapsed)
         self.last_request_time = time.time()
-        
-    def _make_rsc_request(self, url: str, next_url: Optional[str] = None) -> Optional[str]:
-        """
-        Make a rate-limited RSC request with proper headers.
-        
-        Args:
-            url: URL to request
-            next_url: Next-Url header value for RSC routing
-            
-        Returns:
-            Response text or None if failed
-        """
-        self._rate_limit()
-        
-        headers = {}
-        if next_url:
-            headers['Next-Url'] = next_url
-        
-        try:
-            logger.info(f"Making RSC request to: {url}")
-            response = self.session.get(url, headers=headers, timeout=30)
-            response.raise_for_status()
-            return response.text
-        except requests.RequestException as e:
-            logger.error(f"RSC request failed for {url}: {e}")
-            return None
-            
-    def _parse_rsc_redirect(self, rsc_response: str) -> Optional[str]:
-        """
-        Parse RSC response for redirect instructions.
-        
-        Args:
-            rsc_response: Raw RSC response text
-            
-        Returns:
-            Redirect URL or None if no redirect found
-        """
-        # Look for NEXT_REDIRECT pattern
-        redirect_pattern = r'E\{"digest":"NEXT_REDIRECT;replace;([^;]+);'
-        match = re.search(redirect_pattern, rsc_response)
-        if match:
-            redirect_path = match.group(1)
-            logger.info(f"Found redirect to: {redirect_path}")
-            return f"https://learn.udacity.com{redirect_path}"
-        return None
-        
-    def _find_program_tree_in_obj(self, obj: Any) -> Optional[Dict[str, Any]]:
-        """Recursively search for programTree query data in a parsed JSON object."""
-        if isinstance(obj, dict):
-            # Check if this is a React Query state with queries array
-            if 'queries' in obj and isinstance(obj['queries'], list):
-                for query in obj['queries']:
-                    if (isinstance(query, dict) and 
-                        query.get('queryKey') == ['programTree'] and
-                        'state' in query and 'data' in query['state']):
-                        return query['state']['data']
-            # Check if this dict directly has programTree-like structure
-            if ('parts' in obj or 'lessons' in obj) and 'title' in obj and 'key' in obj:
-                return obj
-            # Recurse into dict values
-            for v in obj.values():
-                result = self._find_program_tree_in_obj(v)
-                if result:
-                    return result
-        elif isinstance(obj, list):
-            for item in obj:
-                result = self._find_program_tree_in_obj(item)
-                if result:
-                    return result
-        return None
 
-    def _extract_rsc_segments(self, rsc_response: str) -> List[str]:
-        """
-        Extract all RSC segments from response text.
-        
-        RSC format can pack multiple segments per line. T-prefixed segments
-        have a hex length, and the next segment follows immediately after.
-        Format: ID:T{hex_length},{content_of_that_length}NEXT_SEGMENT
-        """
-        segments = []
-        for line in rsc_response.split('\n'):
-            # Process T-blocks: they have a fixed length and more data may follow
-            remaining = line
-            while remaining:
-                t_match = re.match(r'^([0-9a-fA-F]+):T([0-9a-fA-F]+),', remaining)
-                if t_match:
-                    hex_len = int(t_match.group(2), 16)
-                    content_start = t_match.end()
-                    # Skip past the T-block content
-                    remaining = remaining[content_start + hex_len:]
-                    continue
-                
-                # Regular RSC segment: hexkey:value
-                seg_match = re.match(r'^([0-9a-fA-F]+):', remaining)
-                if seg_match:
-                    segments.append(remaining)
-                    break  # Rest of line is this segment
-                else:
-                    # Not an RSC-formatted line
-                    break
-        return segments
+    def _graphql(self, query: str, variables: Optional[Dict[str, Any]] = None) -> Dict[str, Any]:
+        """Execute a GraphQL query and return the `data` dict (or raise)."""
+        self._wait()
+        payload: Dict[str, Any] = {"query": query}
+        if variables:
+            payload["variables"] = variables
 
-    def _parse_rsc_program_tree(self, rsc_response: str) -> Optional[Dict[str, Any]]:
-        """
-        Parse RSC response to extract programTree data.
-        
-        The RSC format packs segments together. T-blocks (text content) have
-        a hex length prefix, and JSON segments can follow on the same line.
-        The programTree is inside a React Query hydration state's queries array.
-        """
-        segments = self._extract_rsc_segments(rsc_response)
-        
-        for segment in segments:
-            if '"programTree"' not in segment:
-                continue
-                
-            match = re.match(r'^[0-9a-fA-F]+:', segment)
-            if not match:
-                continue
-                
-            json_str = segment[match.end():]
-            try:
-                data = json.loads(json_str)
-                result = self._find_program_tree_in_obj(data)
-                if result:
-                    logger.info(f"Found programTree with {len(result.get('parts', []))} parts")
-                    return result
-            except (json.JSONDecodeError, ValueError) as e:
-                logger.debug(f"Failed to parse RSC segment as JSON: {e}")
-                continue
-                    
-        logger.warning("programTree not found in RSC response")
-        return None
-        
-    def _extract_t_blocks(self, rsc_response: str) -> List[str]:
-        """
-        Extract T-block text content from RSC response.
-        T-blocks span multiple lines: ID:T{hex_length},{content_of_exact_byte_length}
-        """
-        blocks = []
-        # Find all T-block headers in the raw response (not split by newline)
-        for m in re.finditer(r'([0-9a-fA-F]+):T([0-9a-fA-F]+),', rsc_response):
-            hex_len = int(m.group(2), 16)
-            content_start = m.end()
-            content = rsc_response[content_start:content_start + hex_len]
-            # Skip base64-encoded search keys and other non-content blocks
-            if not content or re.match(r'^[A-Za-z0-9+/=]{50,}$', content.strip()):
-                continue
-            # Skip Marvin AI tutor chat blocks — "Marvin" component ref appears nearby before
-            context_before = rsc_response[max(0, m.start() - 500):m.start()]
-            if '"Marvin"' in context_before:
-                logger.debug(f"Skipping Marvin chat T-block (id={m.group(1)}, {hex_len} bytes)")
-                continue
-            blocks.append(content)
-        return blocks
+        logger.debug("GraphQL request: %s", json.dumps(payload, indent=2)[:500])
+        resp = self.session.post(GRAPHQL_ENDPOINT, json=payload, timeout=30)
+        resp.raise_for_status()
+        body = resp.json()
 
-    def _find_atoms_in_obj(self, obj: Any) -> Optional[List[Dict]]:
-        """Recursively search for an atoms list in a parsed JSON object."""
-        if isinstance(obj, dict):
-            if 'atoms' in obj and isinstance(obj['atoms'], list):
-                return obj['atoms']
-            for v in obj.values():
-                result = self._find_atoms_in_obj(v)
-                if result:
-                    return result
-        elif isinstance(obj, list):
-            for item in obj:
-                result = self._find_atoms_in_obj(item)
-                if result:
-                    return result
-        return None
+        if "errors" in body:
+            logger.debug("GraphQL errors: %s", body["errors"])
+            raise ValueError(body["errors"])
+        return body.get("data", {})
 
-    def _extract_concept_atoms(self, rsc_response: str) -> List[Dict]:
-        """
-        Extract concept atom data (video, text, image, quiz) from RSC response.
-        Atoms are in JSON segments with the structure: {atoms: [{semanticType, video/text/...}]}
-        """
-        for seg in self._extract_rsc_segments(rsc_response):
-            if 'atoms' not in seg:
-                continue
-            m = re.match(r'^[0-9a-fA-F]+:', seg)
-            if not m:
-                continue
-            try:
-                data = json.loads(seg[m.end():])
-                found = self._find_atoms_in_obj(data)
-                if found:
-                    return found
-            except (json.JSONDecodeError, ValueError):
-                continue
-        return []
+    @staticmethod
+    def _sanitize_filename(name: str) -> str:
+        name = name.replace("..", "_")
+        for ch in '<>:"/\\|?*':
+            name = name.replace(ch, "_")
+        return name[:100].strip(". ")
 
-    def _parse_concept_data(self, rsc_response: str) -> Dict[str, Any]:
-        """
-        Parse concept page RSC response to extract text content and video info.
-        Returns dict with 'text' (markdown), 'videos' (list of dicts), 'subtitle_urls' (list of strs).
-        """
-        result = {'text': '', 'videos': [], 'subtitle_urls': []}
+    # ------------------------------------------------------------------
+    # Data fetching
+    # ------------------------------------------------------------------
 
-        # Method 1: Extract from atoms (structured data - has video info)
-        atoms = self._extract_concept_atoms(rsc_response)
-        if atoms:
-            text_parts = []
-            for atom in atoms:
-                st = atom.get('semanticType', '')
-                if st == 'VideoAtom' and 'video' in atom:
-                    video = atom['video']
-                    result['videos'].append({
-                        'youtube_id': video.get('youtubeId'),
-                        'topher_id': video.get('topherId'),
-                    })
-                    sub_url = video.get('subtitlesUrl')
-                    if sub_url:
-                        result['subtitle_urls'].append(sub_url)
-                elif st == 'TextAtom' and 'text' in atom:
-                    text_parts.append(atom['text'])
-                elif st == 'ImageAtom' and 'image' in atom:
-                    img = atom['image']
-                    if isinstance(img, dict) and img.get('url'):
-                        text_parts.append(f"![{img.get('caption', 'Image')}]({img['url']})")
-            if text_parts:
-                result['text'] = '\n\n'.join(text_parts)
-            # If atoms were found (even just video), don't fall back to T-blocks
-            # T-blocks may contain Marvin AI chat history which is unrelated
-            return result
-        
-        # Method 2: Extract from T-blocks ONLY if no atoms were found at all
-        # This handles pages where content is rendered purely as RSC text blocks
-        t_blocks = self._extract_t_blocks(rsc_response)
-        if t_blocks:
-            result['text'] = '\n\n'.join(t_blocks)
-        
-        return result
-        
     def _get_course_data(self, course_key: str) -> Optional[Dict[str, Any]]:
         """
-        Fetch course data using RSC API.
-        
-        Args:
-            course_key: Course identifier (e.g., 'nd123')
-            
-        Returns:
-            Course data dictionary or None if failed
-        """
-        # Step 1: Initial RSC request
-        initial_url = f"https://learn.udacity.com/{course_key}"
-        initial_response = self._make_rsc_request(initial_url, next_url=f"/{course_key}")
-        
-        if not initial_response:
-            return None
-            
-        # Step 2: Check for redirect
-        redirect_url = self._parse_rsc_redirect(initial_response)
-        
-        if redirect_url:
-            # Follow the redirect
-            parsed_url = urllib.parse.urlparse(redirect_url)
-            redirect_response = self._make_rsc_request(redirect_url, next_url=parsed_url.path)
-            if redirect_response:
-                program_tree = self._parse_rsc_program_tree(redirect_response)
-            else:
-                program_tree = None
-        else:
-            # Try to parse programTree from initial response
-            program_tree = self._parse_rsc_program_tree(initial_response)
-            
-        return program_tree
-        
-    def _get_concept_content(self, course_key: str, version: str, part_key: str, 
-                           lesson_key: str, concept_key: str) -> Dict[str, Any]:
-        """
-        Fetch individual concept content including text and video data.
-        
-        Returns:
-            Dict with 'text' (str), 'videos' (list), 'subtitle_urls' (list)
-        """
-        params = f"version={version}&lessonKey={lesson_key}&conceptKey={concept_key}"
-        if part_key:
-            params = f"version={version}&partKey={part_key}&lessonKey={lesson_key}&conceptKey={concept_key}"
-        concept_url = f"https://learn.udacity.com/{course_key}?{params}"
+        Fetch course structure via GraphQL.
 
-        response = self._make_rsc_request(concept_url, next_url=f"/{course_key}")
-        if not response:
-            return {'text': '', 'videos': [], 'subtitle_urls': []}
+        Tries nanodegree first, then course.  Returns a normalised dict with
+        keys: title, version, semantic_type, parts (list of dicts with lessons).
+        For plain courses the lessons are wrapped in a single virtual part.
+        """
+        # --- Try nanodegree first ---
+        try:
+            data = self._graphql(NANODEGREE_STRUCTURE_QUERY, {"key": course_key})
+            nd = data.get("nanodegree")
+            if nd:
+                logger.info("Fetched nanodegree: %s", nd.get("title"))
+                # Flatten modules into lessons per part
+                parts = []
+                for part in nd.get("parts") or []:
+                    lessons = []
+                    for module in part.get("modules") or []:
+                        lessons.extend(module.get("lessons") or [])
+                    parts.append({
+                        "key": part["key"],
+                        "title": part.get("title", "Untitled Part"),
+                        "lessons": lessons,
+                    })
+                return {
+                    "title": nd["title"],
+                    "version": nd.get("version", "1.0.0"),
+                    "semantic_type": nd.get("semantic_type"),
+                    "parts": parts,
+                }
+        except (ValueError, requests.RequestException) as exc:
+            logger.debug("Nanodegree query failed for %s: %s", course_key, exc)
 
-        # Follow redirect if concept is routed to a different lessonKey
-        redirect_url = self._parse_rsc_redirect(response)
-        if redirect_url:
-            parsed = urllib.parse.urlparse(redirect_url)
-            response = self._make_rsc_request(redirect_url, next_url=parsed.path)
-            if not response:
-                return {'text': '', 'videos': [], 'subtitle_urls': []}
-        
-        return self._parse_concept_data(response)
-        
-    def _sanitize_filename(self, filename: str) -> str:
-        """Sanitize filename for filesystem compatibility"""
-        # Remove path separators and parent directory references
-        filename = filename.replace('..', '_')
-        # Replace invalid characters with underscores
-        invalid_chars = '<>:"/\\|?*'
-        for char in invalid_chars:
-            filename = filename.replace(char, '_')
-        # Limit length and strip trailing dots/spaces (Windows compat)
-        return filename[:100].strip('. ')
-        
+        # --- Fall back to course ---
+        try:
+            data = self._graphql(COURSE_STRUCTURE_QUERY, {"key": course_key})
+            course = data.get("course")
+            if course:
+                logger.info("Fetched course: %s", course.get("title"))
+                return {
+                    "title": course["title"],
+                    "version": course.get("version", "1.0.0"),
+                    "semantic_type": course.get("semantic_type"),
+                    "lessons": course.get("lessons") or [],
+                }
+        except (ValueError, requests.RequestException) as exc:
+            logger.error("Course query also failed for %s: %s", course_key, exc)
+
+        return None
+
+    def _get_concept_atoms(self, concept_key: str) -> Dict[str, Any]:
+        """Fetch atoms for a single concept.  Returns parsed concept dict."""
+        try:
+            data = self._graphql(CONCEPT_ATOMS_QUERY, {"key": concept_key})
+            return data.get("concept") or {}
+        except (ValueError, requests.RequestException) as exc:
+            logger.error("Failed to fetch atoms for concept %s: %s", concept_key, exc)
+            return {}
+
+    # ------------------------------------------------------------------
+    # Downloading helpers
+    # ------------------------------------------------------------------
+
     def _download_file(self, url: str, filepath: Path, description: str = "") -> bool:
-        """
-        Download a file with progress bar and resume capability.
-        
-        Args:
-            url: URL to download
-            filepath: Local path to save file
-            description: Description for progress bar
-            
-        Returns:
-            True if successful, False otherwise
-        """
-        # Skip if already downloaded
         if str(filepath) in self.downloaded_files or filepath.exists():
-            logger.info(f"Skipping {filepath.name} (already exists)")
+            logger.info("Skipping %s (already exists)", filepath.name)
             self.downloaded_files.add(str(filepath))
             return True
-            
-        # Create parent directories
+
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        
+
         try:
-            # Get file size for progress bar
-            self._rate_limit()
-            head_response = self.download_session.head(url, timeout=10)
-            total_size = int(head_response.headers.get('content-length', 0))
-            
-            # Download with progress bar
-            self._rate_limit()
-            response = self.download_session.get(url, stream=True, timeout=60)
-            response.raise_for_status()
-            
-            with open(filepath, 'wb') as file, tqdm(
+            self._wait()
+            head = self.download_session.head(url, timeout=10, allow_redirects=True)
+            total_size = int(head.headers.get("content-length", 0))
+
+            self._wait()
+            resp = self.download_session.get(url, stream=True, timeout=60)
+            resp.raise_for_status()
+
+            with open(filepath, "wb") as fh, tqdm(
                 desc=description or filepath.name[:50],
                 total=total_size,
-                unit='B',
+                unit="B",
                 unit_scale=True,
                 unit_divisor=1024,
                 leave=False,
             ) as pbar:
-                for chunk in response.iter_content(chunk_size=8192):
+                for chunk in resp.iter_content(chunk_size=8192):
                     if chunk:
-                        file.write(chunk)
+                        fh.write(chunk)
                         pbar.update(len(chunk))
-                        
+
             self.downloaded_files.add(str(filepath))
-            logger.info(f"Downloaded {filepath.name}")
+            logger.info("Downloaded %s", filepath.name)
             return True
-            
-        except Exception as e:
-            logger.error(f"Failed to download {url}: {e}")
-            # Clean up partial download
+        except Exception as exc:
+            logger.error("Failed to download %s: %s", url, exc)
             if filepath.exists():
                 filepath.unlink()
             return False
-            
-    def _process_lesson_resources(self, resources: List[Dict], lesson_dir: Path, 
-                                lesson_title: str) -> int:
-        """
-        Download all resources for a lesson.
-        
-        Args:
-            resources: List of resource dictionaries
-            lesson_dir: Directory to save resources
-            lesson_title: Lesson title for progress descriptions
-            
-        Returns:
-            Number of successfully downloaded resources
-        """
+
+    def _process_lesson_resources(self, resources: List[Dict], lesson_dir: Path,
+                                  lesson_title: str) -> int:
         if not resources:
             return 0
-            
-        success_count = 0
+
+        success = 0
         resources_dir = lesson_dir / "resources"
-        
-        for resource in resources:
-            if not isinstance(resource, dict) or 'uri' not in resource:
+
+        for res in resources:
+            files = res.get("files") if isinstance(res, dict) else None
+            if not files:
                 continue
-                
-            uri = resource['uri']
-            name = resource.get('name', 'Unknown Resource')
-            
-            # Determine filename and subdirectory
-            filename = Path(urllib.parse.urlparse(uri).path).name
-            if not filename:
-                continue
-                
-            # Organize by resource type — zips in lesson dir, other resources in resources/
-            if filename.endswith('.zip'):
-                filepath = lesson_dir / filename
-            else:
-                filepath = resources_dir / filename
-                
-            if self._download_file(uri, filepath, f"{lesson_title}: {name}"):
-                success_count += 1
-                
-        return success_count
-        
-    def _save_concept_content(self, concepts: List[Dict], lesson_dir: Path,
-                            course_key: str, version: str, part_key: str, 
-                            lesson_key: str) -> int:
-        """
-        Save concept text content as markdown files directly in lesson dir.
-        Includes video links (YouTube) and subtitle URLs when available.
-        """
+            for f in files:
+                uri = f.get("uri")
+                name = f.get("name", "file")
+                if not uri:
+                    continue
+                filename = Path(urllib.parse.urlparse(uri).path).name or name
+                if filename.endswith(".zip"):
+                    fpath = lesson_dir / filename
+                else:
+                    fpath = resources_dir / filename
+                if self._download_file(uri, fpath, f"{lesson_title}: {name}"):
+                    success += 1
+        return success
+
+    # ------------------------------------------------------------------
+    # Concept → Markdown
+    # ------------------------------------------------------------------
+
+    def _save_concept_content(self, concepts: List[Dict], lesson_dir: Path) -> int:
         if not concepts:
             return 0
-            
-        saved_count = 0
-        
+
+        saved = 0
         for i, concept in enumerate(concepts, 1):
-            if not isinstance(concept, dict) or 'key' not in concept:
-                continue
-                
-            concept_key = concept['key']
-            concept_title = concept.get('title', f'Concept {i}')
-            
-            # Create safe filename — directly in lesson dir (no concepts/ subdir)
+            concept_key = concept.get("key")
+            concept_title = concept.get("title", f"Concept {i}")
             safe_title = self._sanitize_filename(concept_title)
-            filename = f"{i:02d}_{safe_title}.md"
-            filepath = lesson_dir / filename
-            
-            # Skip if already exists
+            filepath = lesson_dir / f"{i:02d}_{safe_title}.md"
+
             if filepath.exists():
-                saved_count += 1
+                saved += 1
                 continue
-                
-            # Fetch concept content
-            logger.info(f"Fetching concept content: {concept_title}")
-            data = self._get_concept_content(
-                course_key, version, part_key, lesson_key, concept_key
-            )
-            
-            text = data.get('text', '')
-            videos = data.get('videos', [])
-            subtitle_urls = data.get('subtitle_urls', [])
 
-            if text or videos:
-                # Build markdown file
-                md = f"# {concept_title}\n\n"
+            logger.info("Fetching atoms for concept: %s", concept_title)
+            atom_data = self._get_concept_atoms(concept_key)
+            atoms = atom_data.get("atoms") or []
 
-                # Add video info if present
-                if videos:
-                    for video in videos:
-                        yt_id = video.get('youtube_id')
-                        if yt_id and re.match(r'^[\w-]+$', yt_id):
-                            md += f"🎥 **Video:** [Watch on YouTube](https://www.youtube.com/watch?v={yt_id})\n\n"
-                    for sub_url in subtitle_urls:
-                        md += f"📝 **Subtitles:** [VTT]({sub_url})\n\n"
-                    md += "---\n\n"
-                
-                if text:
-                    md += text
-                
-                filepath.write_text(md, encoding='utf-8')
-                logger.info(f"Saved concept: {filename}")
-                saved_count += 1
-            else:
-                logger.warning(f"No content found for concept: {concept_title}")
-                
-        return saved_count
-        
+            text_parts: List[str] = []
+            videos: List[Dict[str, Any]] = []
+            subtitle_urls: List[str] = []
+
+            for atom in atoms:
+                st = atom.get("semantic_type", "")
+                if st == "VideoAtom" and "video" in atom:
+                    vid = atom["video"]
+                    videos.append({
+                        "youtube_id": vid.get("youtube_id"),
+                        "topher_id": vid.get("topher_id"),
+                    })
+                    sub_url = vid.get("subtitles_vtt_url")
+                    if sub_url:
+                        subtitle_urls.append(sub_url)
+                elif st == "TextAtom" and atom.get("text"):
+                    text_parts.append(atom["text"])
+                elif st == "ImageAtom" and atom.get("url"):
+                    caption = atom.get("caption", "Image")
+                    text_parts.append(f"![{caption}]({atom['url']})")
+
+            if not text_parts and not videos:
+                logger.warning("No content for concept: %s", concept_title)
+                continue
+
+            md = f"# {concept_title}\n\n"
+            if videos:
+                for vid in videos:
+                    yt_id = vid.get("youtube_id")
+                    if yt_id and re.match(r"^[\w-]+$", yt_id):
+                        md += f"🎥 **Video:** [Watch on YouTube](https://www.youtube.com/watch?v={yt_id})\n\n"
+                for sub_url in subtitle_urls:
+                    md += f"📝 **Subtitles:** [VTT]({sub_url})\n\n"
+                md += "---\n\n"
+            if text_parts:
+                md += "\n\n".join(text_parts)
+
+            filepath.parent.mkdir(parents=True, exist_ok=True)
+            filepath.write_text(md, encoding="utf-8")
+            logger.info("Saved concept: %s", filepath.name)
+            saved += 1
+
+        return saved
+
+    # ------------------------------------------------------------------
+    # Main download logic
+    # ------------------------------------------------------------------
+
     def download_course(self, course_key: str) -> bool:
-        """
-        Download a complete course.
-        Handles both nanodegree (parts → lessons) and simple course (lessons only) structures.
-        """
         print(f"\n🎓 Starting download for course: {course_key}")
-        logger.info(f"Starting course download: {course_key}")
-        
-        # Fetch course data using RSC API
-        print(f"🌐 Fetching course structure from Udacity RSC API...")
+        logger.info("Starting course download: %s", course_key)
+
+        print("🌐 Fetching course structure via GraphQL API...")
         course_data = self._get_course_data(course_key)
-        
         if not course_data:
             print(f"❌ Failed to fetch course data for {course_key}")
             return False
-            
-        # Extract course information
-        course_title = course_data.get('title', course_key)
-        version = course_data.get('version', '1.0.0')
-        
-        # Course dir: "<id> <title>"
+
+        course_title = course_data.get("title", course_key)
+        version = course_data.get("version", "1.0.0")
+
         safe_title = self._sanitize_filename(course_title)
         course_dir = self.output_dir / f"{course_key} {safe_title}"
         course_dir.mkdir(parents=True, exist_ok=True)
-        
-        # Handle both structures:
-        # - Nanodegrees have "parts" containing "lessons"
-        # - Simple courses (ud*) have "lessons" directly at top level
-        parts = course_data.get('parts') or []
-        top_level_lessons = course_data.get('lessons') or []
-        
-        if not parts and top_level_lessons:
-            # Simple course: wrap lessons in a single virtual part
-            parts = [{
-                'key': '',
-                'title': course_title,
-                'lessons': top_level_lessons,
-            }]
+
+        # Normalise to parts list
+        parts = course_data.get("parts") or []
+        top_lessons = course_data.get("lessons") or []
+        if not parts and top_lessons:
+            parts = [{"key": "", "title": course_title, "lessons": top_lessons}]
             print(f"📚 Course: {course_title} (simple course)")
-            print(f"📄 Found {len(top_level_lessons)} lessons")
+            print(f"📄 Found {len(top_lessons)} lessons")
         else:
-            print(f"📚 Course: {course_title}")
-            print(f"📁 Found {len(parts)} parts")
-        
-        # Save course metadata
+            total_lessons = sum(len(p.get("lessons", [])) for p in parts)
+            print(f"📚 Nanodegree: {course_title}")
+            print(f"📁 Found {len(parts)} parts, {total_lessons} lessons")
+
+        # Save metadata
         metadata = {
-            'course_key': course_key,
-            'title': course_title,
-            'version': version,
-            'parts_count': len(parts),
-            'download_date': time.strftime('%Y-%m-%d %H:%M:%S'),
+            "course_key": course_key,
+            "title": course_title,
+            "version": version,
+            "parts_count": len(parts),
+            "download_date": time.strftime("%Y-%m-%d %H:%M:%S"),
         }
-        
-        (course_dir / 'course_metadata.json').write_text(
-            json.dumps(metadata, indent=2), encoding='utf-8'
+        (course_dir / "course_metadata.json").write_text(
+            json.dumps(metadata, indent=2), encoding="utf-8"
         )
-        
-        # Process each part
+
         total_lessons = 0
         total_concepts = 0
         total_downloads = 0
-        
+
         for part_idx, part in enumerate(parts, 1):
-            if not isinstance(part, dict):
-                continue
-                
-            part_key = part.get('key', '')
-            part_title = part.get('title', 'Unknown Part')
-            lessons = part.get('lessons') or []
-            
+            part_title = part.get("title", "Untitled Part")
+            lessons = part.get("lessons") or []
             print(f"\n📖 Part {part_idx}: {part_title} ({len(lessons)} lessons)")
-            
-            # Numbered part directory (skip if single virtual part for simple courses)
-            safe_part_title = self._sanitize_filename(part_title)
-            if len(parts) > 1:
-                part_dir = course_dir / f"{part_idx:02d} {safe_part_title}"
-            else:
-                part_dir = course_dir  # Simple course: lessons directly in course dir
-            
+
+            safe_part = self._sanitize_filename(part_title)
+            part_dir = (course_dir / f"{part_idx:02d} {safe_part}") if len(parts) > 1 else course_dir
+
             for lesson_idx, lesson in enumerate(lessons, 1):
-                if not isinstance(lesson, dict):
-                    continue
-                    
-                lesson_key = lesson.get('key', '')
-                lesson_title = lesson.get('title', 'Unknown Lesson')
-                concepts = lesson.get('concepts') or []
-                resources = lesson.get('resources') or []
-                
+                lesson_title = lesson.get("title", "Untitled Lesson")
+                concepts = lesson.get("concepts") or []
+                resources = lesson.get("resources") or []
                 print(f"  📄 {lesson_idx}. {lesson_title} ({len(concepts)} concepts, {len(resources)} resources)")
                 total_lessons += 1
-                
-                # Numbered lesson directory
-                safe_lesson_title = self._sanitize_filename(lesson_title)
-                lesson_dir = part_dir / f"{lesson_idx:02d} {safe_lesson_title}"
+
+                safe_lesson = self._sanitize_filename(lesson_title)
+                lesson_dir = part_dir / f"{lesson_idx:02d} {safe_lesson}"
                 lesson_dir.mkdir(parents=True, exist_ok=True)
 
-                # Save lesson metadata
-                lesson_metadata = {
-                    'lesson_key': lesson_key,
-                    'title': lesson_title,
-                    'part_title': part_title,
-                    'concepts_count': len(concepts),
-                    'resources_count': len(resources),
+                lesson_meta = {
+                    "lesson_key": lesson.get("key", ""),
+                    "title": lesson_title,
+                    "part_title": part_title,
+                    "concepts_count": len(concepts),
+                    "resources_count": len(resources),
                 }
-                (lesson_dir / 'lesson_metadata.json').write_text(
-                    json.dumps(lesson_metadata, indent=2), encoding='utf-8'
+                (lesson_dir / "lesson_metadata.json").write_text(
+                    json.dumps(lesson_meta, indent=2), encoding="utf-8"
                 )
 
-                # Download resources
-                downloaded_resources = self._process_lesson_resources(
-                    resources, lesson_dir, lesson_title
-                )
-                total_downloads += downloaded_resources
-                
-                # Save concept content (directly in lesson dir, no concepts/ subdir)
-                saved_concepts = self._save_concept_content(
-                    concepts, lesson_dir, course_key, version, 
-                    part_key, lesson_key
-                )
-                total_concepts += saved_concepts
-                
-        # Print summary
+                total_downloads += self._process_lesson_resources(resources, lesson_dir, lesson_title)
+                total_concepts += self._save_concept_content(concepts, lesson_dir)
+
         print(f"\n🎉 Course {course_key} download completed!")
         print(f"📊 Summary:")
         print(f"  - Parts: {len(parts)}")
         print(f"  - Lessons: {total_lessons}")
-        print(f"  - Concepts: {total_concepts}")
-        print(f"  - Downloaded files: {total_downloads}")
-        
-        logger.info(f"Course download completed: {course_key}")
+        print(f"  - Concepts saved: {total_concepts}")
+        print(f"  - Resource files: {total_downloads}")
+        logger.info("Course download completed: %s", course_key)
         return True
-        
+
+
+# ======================================================================
+# CLI
+# ======================================================================
 
 def main():
-    """Main entry point"""
     parser = argparse.ArgumentParser(
-        description="Download Udacity courses from learn.udacity.com (RSC backend)",
+        description="Download Udacity courses via the classroom-content GraphQL API",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
   python download.py nd123 --token YOUR_JWT_TOKEN
   UDACITY_TOKEN=token python download.py nd123 nd456
-  python download.py nd123 --output-dir ./downloads --rate-limit 2.0
-  
-Note: Use Cookie JWT token (not Bearer token) from browser DevTools.
-        """,
+  python download.py ud777 --output-dir ./downloads --rate-limit 2.0
+""",
     )
-    
-    parser.add_argument(
-        'courses',
-        nargs='+',
-        help='Course keys to download (e.g., nd123, nd456)',
-    )
-    
-    parser.add_argument(
-        '--token',
-        help='JWT authentication token (can also use UDACITY_TOKEN env var)',
-    )
-    
-    parser.add_argument(
-        '--output-dir',
-        default='output',
-        help='Output directory for downloads (default: output)',
-    )
-    
-    parser.add_argument(
-        '--rate-limit',
-        type=float,
-        default=1.5,
-        help='Seconds to wait between requests (default: 1.5)',
-    )
-    
-    parser.add_argument(
-        '--debug',
-        action='store_true',
-        help='Enable debug logging',
-    )
-    
+
+    parser.add_argument("courses", nargs="+", help="Course keys to download (e.g. nd123, ud777)")
+    parser.add_argument("--token", help="JWT token (or set UDACITY_TOKEN env var)")
+    parser.add_argument("--output-dir", default="output", help="Output directory (default: output)")
+    parser.add_argument("--rate-limit", type=float, default=1.5, help="Seconds between requests (default: 1.5)")
+    parser.add_argument("--debug", action="store_true", help="Enable debug logging")
+
     args = parser.parse_args()
-    
-    # Configure logging level
+
     if args.debug:
         logging.getLogger().setLevel(logging.DEBUG)
-        
-    # Get token from argument or environment
-    token = args.token or os.getenv('UDACITY_TOKEN')
+
+    token = args.token or os.getenv("UDACITY_TOKEN")
     if not token:
-        print("❌ Error: JWT token required. Use --token argument or UDACITY_TOKEN environment variable.")
-        print("💡 Get your token from browser DevTools > Network > Cookie: _jwt=...")
+        print("❌ Error: JWT token required. Use --token or set UDACITY_TOKEN env var.")
+        print("💡 Get your token from browser DevTools → Application → Cookies → _jwt")
         sys.exit(1)
-        
-    print("🚀 Udacity Course Downloader (RSC Backend)")
+
+    print("🚀 Udacity Course Downloader (GraphQL API)")
     print(f"📁 Output directory: {args.output_dir}")
-    print(f"⏱️  Rate limit: {args.rate_limit} seconds")
-    print(f"🎯 Courses to download: {', '.join(args.courses)}")
-    
-    # Initialize downloader
-    downloader = UdacityDownloader(
-        token=token,
-        output_dir=args.output_dir,
-        rate_limit=args.rate_limit,
-    )
-    
-    # Download each course
-    success_count = 0
-    for course_key in args.courses:
+    print(f"⏱️  Rate limit: {args.rate_limit}s")
+    print(f"🎯 Courses: {', '.join(args.courses)}")
+
+    downloader = UdacityDownloader(token=token, output_dir=args.output_dir, rate_limit=args.rate_limit)
+
+    success = 0
+    for key in args.courses:
         try:
-            if downloader.download_course(course_key):
-                success_count += 1
+            if downloader.download_course(key):
+                success += 1
         except KeyboardInterrupt:
-            print("\n⏹️  Download interrupted by user")
+            print("\n⏹️  Interrupted by user")
             break
-        except Exception as e:
-            print(f"❌ Unexpected error downloading {course_key}: {e}")
-            logger.exception(f"Unexpected error downloading {course_key}")
-            
-    print(f"\n📊 Download Summary: {success_count}/{len(args.courses)} courses successful")
-    
-    if success_count == len(args.courses):
-        print("🎉 All downloads completed successfully!")
-    elif success_count > 0:
-        print("⚠️  Some downloads failed. Check output above for details.")
+        except Exception as exc:
+            print(f"❌ Error downloading {key}: {exc}")
+            logger.exception("Error downloading %s", key)
+
+    print(f"\n📊 Result: {success}/{len(args.courses)} courses successful")
+    if success == len(args.courses):
+        print("🎉 All downloads completed!")
+    elif success > 0:
+        print("⚠️  Some downloads failed.")
     else:
         print("❌ All downloads failed.")
         sys.exit(1)

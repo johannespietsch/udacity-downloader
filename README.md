@@ -1,276 +1,161 @@
-# Udacity Course Downloader (RSC Backend)
+# Udacity Course Downloader (GraphQL API)
 
 > ⚠️ **Legal Disclaimer:** This tool is an independent personal backup utility for enrolled Udacity students. It is **not affiliated with, endorsed by, or associated with Udacity, Inc.** Users are solely responsible for ensuring their use complies with [Udacity's Terms of Use](https://www.udacity.com/legal/terms-of-use) and all applicable laws. **Do not** use this tool to redistribute, sell, or share downloaded content. Only download courses you are actively enrolled in and have paid for.
 
-A Python script to download course content from Udacity's Next.js learning platform (learn.udacity.com). This version works with Udacity's React Server Components (RSC) backend and properly handles their new authentication and data structure.
+A Python script to download course content from Udacity's learning platform (`learn.udacity.com`). Uses Udacity's classroom-content GraphQL API to fetch course structure and content directly.
 
 ## Features
 
-- ✅ **Complete Course Downloads** - Videos, subtitles, course materials, and text content
-- ✅ **RSC Backend Support** - Works with Udacity's Next.js React Server Components API
-- ✅ **Proper Authentication** - Uses Cookie-based JWT authentication (not Bearer tokens)
-- ✅ **Concept Content Extraction** - Downloads lesson text content as markdown files
-- ✅ **Resumable Downloads** - Skip already downloaded files
-- ✅ **Progress Tracking** - Real-time progress bars with file sizes
-- ✅ **Rate Limiting** - Respectful downloading to avoid overwhelming servers
-- ✅ **Error Handling** - Graceful retry logic and comprehensive error reporting
-- ✅ **Organized Output** - Clean folder structure by course, part, and lesson
-- ✅ **Metadata Preservation** - Saves course and lesson metadata as JSON
+- ✅ **GraphQL API** — Fetches structured course data directly (no HTML/RSC parsing)
+- ✅ **Complete Downloads** — Videos (YouTube links), subtitles, text content, images, resources
+- ✅ **Nanodegree & Course Support** — Handles both `nd*` nanodegrees and `ud*/cd*` courses
+- ✅ **Concept Content** — Each concept saved as a Markdown file with video links and text
+- ✅ **Resumable** — Skips already-downloaded files automatically
+- ✅ **Progress Bars** — Real-time download progress with tqdm
+- ✅ **Rate Limiting** — Configurable delay between API requests
+- ✅ **Organized Output** — Clean folder hierarchy: course → parts → lessons → concepts
 
 ## How It Works
 
-This downloader works with Udacity's new Next.js backend that uses React Server Components (RSC):
-
-1. **RSC Authentication** - Uses `Cookie: _jwt=TOKEN` instead of `Authorization: Bearer`
-2. **RSC Headers** - Sends proper headers like `Accept: text/x-component`, `RSC: 1`
-3. **Redirect Following** - Follows RSC redirects to get full course data
-4. **Program Tree Parsing** - Extracts course structure from React Query state
-5. **Content Extraction** - Parses T-prefixed lines for lesson text content
+1. **Fetch structure** — Queries the GraphQL API for the full course tree (parts → modules → lessons → concepts)
+2. **Fetch atoms** — For each concept, fetches its atoms (text, video, image) individually for progress tracking
+3. **Save content** — Writes Markdown files for concepts; downloads resource files (ZIPs, images, etc.)
 
 ## Requirements
 
 - Python 3.7+
 - Active Udacity account with enrolled courses
-- JWT authentication token from your browser cookies
+- JWT authentication token from your browser
 
 ## Installation
 
-1. Clone or download this repository
-2. Install dependencies:
 ```bash
 pip install -r requirements.txt
 ```
 
 ## Getting Your JWT Token
 
-**Important:** This script requires the JWT token from your browser **cookies**, not the Authorization header.
+The script needs the JWT token from your `_jwt` browser cookie.
 
-### Method 1: Browser Developer Tools (Recommended)
+### Browser DevTools (Recommended)
 
-1. **Open your browser** and go to [learn.udacity.com](https://learn.udacity.com)
-2. **Log in** to your Udacity account
-3. **Open Developer Tools** (F12)
-4. **Go to Application tab** (Chrome) or **Storage tab** (Firefox)
-5. **Find Cookies** for `learn.udacity.com`
-6. **Look for `_jwt` cookie** and copy its value
-7. **Use this value** as your token (without any prefix)
+1. Go to [learn.udacity.com](https://learn.udacity.com) and log in
+2. Open DevTools (F12) → **Application** tab → **Cookies** → `learn.udacity.com`
+3. Find the `_jwt` cookie and copy its value
 
-### Method 2: Network Tab
+### Browser Console
 
-1. **Open Developer Tools** (F12) and go to **Network tab**
-2. **Refresh the page** on learn.udacity.com
-3. **Find any request** to learn.udacity.com
-4. **Look at Request Headers** for `Cookie: _jwt=YOUR_TOKEN_HERE`
-5. **Copy the token** (everything after `_jwt=`)
-
-### Method 3: Browser Console
-
-Run this in the browser console on learn.udacity.com:
 ```javascript
 console.log(document.cookie.split(';').find(c => c.includes('_jwt')).split('=')[1])
 ```
 
 ## Usage
 
-### Basic Usage
-
 ```bash
-# Download a single course
+# Single course
 python download.py nd123 --token YOUR_JWT_TOKEN
 
-# Download multiple courses
-python download.py nd123 nd456 ud789 --token YOUR_JWT_TOKEN
-```
+# Multiple courses
+python download.py nd123 ud777 --token YOUR_JWT_TOKEN
 
-### Using Environment Variable
+# Using environment variable (recommended)
+export UDACITY_TOKEN=your_jwt_token
+python download.py nd123 ud777
 
-```bash
-# Set token as environment variable (recommended for security)
-export UDACITY_TOKEN=your_jwt_token_here
-python download.py nd123 nd456
-
-# Or inline
-UDACITY_TOKEN=your_jwt_token_here python download.py nd123
-```
-
-### Advanced Options
-
-```bash
-# Custom output directory
-python download.py nd123 --output-dir ./my_courses
-
-# Adjust rate limiting (seconds between requests)
-python download.py nd123 --rate-limit 2.0
-
-# Enable debug logging
-python download.py nd123 --debug
-
-# Full example with all options
-python download.py nd123 nd456 \
+# All options
+python download.py nd123 \
   --token YOUR_TOKEN \
   --output-dir ./downloads \
-  --rate-limit 1.5 \
+  --rate-limit 2.0 \
   --debug
 ```
 
-## Output Structure
+### Options
 
-Downloads are organized in the following hierarchical structure:
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--token` | `$UDACITY_TOKEN` | JWT authentication token |
+| `--output-dir` | `output` | Where to save downloads |
+| `--rate-limit` | `1.5` | Seconds between API requests |
+| `--debug` | off | Verbose logging |
+
+## Output Structure
 
 ```
 output/
-├── nd123/                              # Course key
-│   ├── course_metadata.json            # Course information
-│   ├── Test-Driven_Development/        # Part folder
-│   │   ├── Introduction_to_Testing/    # Lesson folder
-│   │   │   ├── lesson_metadata.json    # Lesson information
-│   │   │   ├── Videos.zip               # Lesson videos (if available)
-│   │   │   ├── Subtitles.zip           # Video subtitles (if available)
-│   │   │   ├── concepts/               # Concept text content
-│   │   │   │   ├── 01_What_is_Testing.md
-│   │   │   │   ├── 02_Testing_Benefits.md
-│   │   │   │   └── 03_Testing_Types.md
-│   │   │   └── resources/              # Additional resources
-│   │   │       ├── image1.jpeg
+├── nd123 Course_Title/
+│   ├── course_metadata.json
+│   ├── 01 Part_One/
+│   │   ├── 01 Lesson_One/
+│   │   │   ├── lesson_metadata.json
+│   │   │   ├── 01_First_Concept.md
+│   │   │   ├── 02_Second_Concept.md
+│   │   │   ├── Videos.zip
+│   │   │   └── resources/
 │   │   │       └── diagram.png
-│   │   └── Writing_Tests/              # Another lesson
+│   │   └── 02 Lesson_Two/
 │   │       └── ...
-│   └── AI_Fundamentals/                # Another part
+│   └── 02 Part_Two/
 │       └── ...
-└── nd456/                              # Another course
+└── ud777 Another_Course/
+    ├── course_metadata.json
+    ├── 01 First_Lesson/
+    │   ├── 01_Intro.md
+    │   └── ...
     └── ...
 ```
 
-## What Gets Downloaded
+Simple courses (no parts) put lessons directly in the course directory.
 
-The script downloads and organizes:
+## Concept Markdown Format
 
-- **📹 Video ZIP files** - Complete lesson videos from zips.udacity-data.com
-- **📄 Subtitle ZIP files** - Video subtitles in multiple formats
-- **🖼️ Images and Resources** - Diagrams, images, and other lesson materials
-- **📚 Concept Content** - Lesson text content extracted and saved as Markdown
-- **📋 Metadata** - Course and lesson information in JSON format
+Each concept file includes:
 
-## Concept Content Extraction
-
-This version properly extracts lesson text content from Udacity's RSC backend:
-
-- Each concept is fetched individually using RSC API calls
-- Text content is parsed from T-prefixed lines in RSC responses
-- Content is cleaned and saved as properly formatted Markdown files
-- Files are numbered sequentially (01_, 02_, etc.) for easy reading
+- **Title** as heading
+- **YouTube video links** (🎥) when available
+- **Subtitle URLs** (📝 VTT links) when available
+- **Text content** from TextAtoms
+- **Images** from ImageAtoms (as Markdown image links)
 
 ## Resumable Downloads
 
-The script automatically skips files that already exist, making it safe to:
+Safe to re-run — existing files are automatically skipped. This means you can:
 - Resume interrupted downloads
-- Re-run the script to check for new content
-- Download additional courses without re-downloading existing ones
-
-## Rate Limiting
-
-Default rate limit is 1.5 seconds between requests to be respectful to Udacity's servers. You can adjust this with `--rate-limit`:
-
-- `--rate-limit 1.0` - Faster (1 second between requests)
-- `--rate-limit 2.0` - Slower (2 seconds between requests)
-- `--rate-limit 3.0` - Very conservative (good for avoiding rate limits)
-
-## Error Handling & Logging
-
-The script includes comprehensive error handling and logging:
-
-- **Console output** - Progress updates and important messages
-- **Log file** - Detailed logs saved to `udacity_downloader.log`
-- **Debug mode** - Use `--debug` for verbose logging
-- **Graceful failures** - Continues with other content if individual items fail
-
-## Finding Course Keys
-
-Course keys are the identifiers in Udacity URLs:
-
-- `https://learn.udacity.com/nd123` → Course key is `nd123`
-- `https://learn.udacity.com/c/course-name` → Course key is `course-name`
-
-You can find these by browsing your enrolled courses on learn.udacity.com.
-
-## Security Notes
-
-- **Keep your JWT token secure** - Don't share it or commit it to version control
-- **Tokens expire** - You may need to get a new token periodically (usually after a few hours/days)
-- **Use environment variables** - Safer than command-line arguments for tokens
-- **Only download enrolled courses** - Respect Udacity's terms of service
+- Re-run to check for new content
+- Download additional courses without re-downloading
 
 ## Troubleshooting
 
-### "JWT token required" error
-- Make sure you're using the cookie JWT token, not the Authorization header
-- Check that your token is valid and not expired
-- Get a fresh token from your browser cookies
+### Token errors
+- Make sure you're using the `_jwt` cookie value, not an Authorization header
+- Tokens expire — get a fresh one if downloads fail
 
-### Downloads failing / Empty course data
-- **Token expired** - Get a new JWT token from your browser
-- **Not enrolled** - Verify you're enrolled in the course
-- **Rate limiting** - Try increasing rate limit: `--rate-limit 3.0`
-- **Network issues** - Check your internet connection
+### Empty course data
+- Verify you're enrolled in the course
+- Check the course key matches the URL (e.g. `learn.udacity.com/nd123` → key is `nd123`)
+- Try `--debug` for detailed API responses
 
-### "programTree not found" errors
-- The course might use a different data structure
-- Try with `--debug` to see detailed RSC responses
-- Some courses might not have downloadable content
-- Verify the course key is correct
+### Rate limiting
+- Increase delay: `--rate-limit 3.0`
 
-### RSC parsing issues
-- Udacity might have changed their RSC format
-- Check the log file for detailed error information
-- Try a different course to see if it's course-specific
+## Security Notes
 
-## Technical Details
-
-### RSC (React Server Components) Format
-
-Udacity uses Next.js with React Server Components, which returns data in a special flight format:
-
-- **Request headers**: `Accept: text/x-component`, `RSC: 1`
-- **Authentication**: `Cookie: _jwt=TOKEN` (not Bearer tokens)
-- **Response format**: Lines like `KEY:VALUE` with embedded JSON
-- **Program tree**: Course structure in React Query state under `["programTree"]`
-- **Text content**: In T-prefixed lines like `ID:T{hex_length},{markdown_content}`
-
-### Data Extraction Process
-
-1. **Initial RSC request** to course URL
-2. **Follow redirects** if NEXT_REDIRECT is found
-3. **Parse programTree** from React Query hydration state
-4. **Fetch concept content** for each lesson individually
-5. **Extract resources** and download URLs from course structure
-
-### URL Patterns
-
-The script recognizes these Udacity domains:
-
-- `https://zips.udacity-data.com/` - Video and subtitle ZIP files
-- `https://video.udacity-data.com/` - Video thumbnails and previews  
-- `https://s3.amazonaws.com/` - Additional course resources
+- **Keep tokens private** — don't commit them to version control
+- **Use env vars** — `UDACITY_TOKEN` is safer than `--token` on the command line
+- **Tokens expire** — refresh from your browser periodically
+- **Only download enrolled courses** — respect Udacity's terms
 
 ## Version History
 
-- **v2.0** - Complete rewrite for RSC backend support
-- **v1.0** - Original version (deprecated, incompatible with current Udacity)
-
-## Contributing
-
-Feel free to improve the script:
-
-- Add support for more content types
-- Improve RSC parsing robustness  
-- Add parallel downloads
-- Enhance course structure detection
+- **v3.0** — Rewrite using classroom-content GraphQL API (current)
+- **v2.0** — RSC backend support (deprecated — Udacity changed their rendering)
+- **v1.0** — Original version (deprecated)
 
 ## License
 
 MIT License — see [LICENSE](LICENSE) for details.
 
-This license applies to the **tool's source code only**, not to any content downloaded using it. Downloaded course materials remain the intellectual property of Udacity, Inc. and its licensors, and may be subject to Creative Commons Attribution-NonCommercial-NoDerivs 3.0 licensing where marked.
+This license applies to the **tool's source code only**, not to any content downloaded using it. Downloaded course materials remain the intellectual property of Udacity, Inc. and its licensors.
 
 ## Legal Notice & Disclaimer
 
@@ -285,4 +170,4 @@ This is an independent personal backup utility. By using this tool, you acknowle
 - You will comply with [Udacity's Terms of Use](https://www.udacity.com/legal/terms-of-use) and all applicable laws
 - The authors of this tool accept no liability for misuse or any consequences arising from use of this tool
 
-Downloaded content is intended for **personal, offline study only** as a backup of materials you already have access to through your paid enrollment. The RSC format and API endpoints may change, requiring updates to this script.
+Downloaded content is intended for **personal, offline study only** as a backup of materials you already have access to through your paid enrollment.
